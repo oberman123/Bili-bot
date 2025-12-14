@@ -1,14 +1,13 @@
 import os  
 import datetime as dt
-import re  # ⬅️ תיקון: חסר בייבוא המקורי, משמש לפענוח קלט
-import random # ⬅️ תיקון: חסר בייבוא המקורי, משמש להודעות עידוד
-from datetime import timedelta # ⬅️ תיקון: חסר בייבוא המקורי, משמש לחישובי תאריכים
+import re  
+import random 
+from datetime import timedelta 
 
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from tinydb import TinyDB, Query
-# from flask import Flask, request, jsonify # ⬅️ הסרת jsonify שאינו בשימוש
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 # 💡 הערה: הקוד מוגדר להשתמש בזמן המקומי של המכונה שמריצה אותו, 
 # ואינו דורש התקנות חיצוניות (כגון pytz או tzdata).
