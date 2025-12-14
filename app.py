@@ -1,11 +1,9 @@
-from flask import Flask, request
+import os  
+
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
 from tinydb import TinyDB, Query
-import datetime as dt 
-from datetime import timedelta
-import re
-import random
-from twilio.rest import Client 
+from flask import Flask, request, jsonify
 
 # 💡 הערה: הקוד מוגדר להשתמש בזמן המקומי של המכונה שמריצה אותו, 
 # ואינו דורש התקנות חיצוניות (כגון pytz או tzdata).
