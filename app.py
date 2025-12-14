@@ -1,10 +1,14 @@
 import os  
 import datetime as dt
+import re  # ⬅️ תיקון: חסר בייבוא המקורי, משמש לפענוח קלט
+import random # ⬅️ תיקון: חסר בייבוא המקורי, משמש להודעות עידוד
+from datetime import timedelta # ⬅️ תיקון: חסר בייבוא המקורי, משמש לחישובי תאריכים
 
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from tinydb import TinyDB, Query
-from flask import Flask, request, jsonify
+# from flask import Flask, request, jsonify # ⬅️ הסרת jsonify שאינו בשימוש
+from flask import Flask, request
 
 # 💡 הערה: הקוד מוגדר להשתמש בזמן המקומי של המכונה שמריצה אותו, 
 # ואינו דורש התקנות חיצוניות (כגון pytz או tzdata).
@@ -1005,9 +1009,9 @@ def handle_message(user_id: str, message: str) -> list[str]:
 # VII. הגדרת ה-Webhook והשרת
 # ====================================================
 
-app = Flask(__name__)
+app = Flask(__name__) # ⬅️ וודא/י ששורה זו מופיעה רק כאן או בראש הקובץ!
 
-@app.route("/whatsapp", methods=['POST'])
+@app.route("/sms", methods=['POST']) # ⬅️ תיקון קריטי: שינוי מ- "/whatsapp" ל- "/sms"
 def whatsapp_webhook():
     incoming_message = request.values.get('Body', '') 
     user_id_raw = request.values.get('From', '')  
