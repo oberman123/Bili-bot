@@ -47,7 +47,7 @@ def init_db():
 
 init_db()
 
-@app.route("/whatsapp", methods=['POST'])
+@app.route("/sms", methods=['POST'])
 def whatsapp_reply():
     incoming_msg = request.values.get('Body', '').strip()
     phone_number = request.values.get('From', '')
