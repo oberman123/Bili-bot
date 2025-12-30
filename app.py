@@ -1,83 +1,115 @@
 # app.py
+# WhatsApp Baby Tracker Bot (Twilio + Flask + TinyDB) — MVP for Render
+# - Registration flow: mom name -> baby name -> baby gender -> DOB
+# - Logging: breastfeeding (multi-line supported), bottle, pumping, diaper, sleep start/end/manual
+# - Queries: status, summary, when last, awake time, undo, help
+# - Smart insights: "X hours since last feed/diaper/awake" WITHOUT scheduled messages (Twilio-compatible)
+# - Render-ready port: uses PORT env var
+
+import datetime as dt
 import os
 import re
-import json
-import datetime as dt
 from datetime import timedelta
-from threading import RLock
-
 from flask import Flask, request
-from tinydb import TinyDB, Query
 from twilio.twiml.messaging_response import MessagingResponse
-
+from tinydb import TinyDB, Query
 
 # ====================================================
-# 0) Render / TinyDB storage
+# I. App + DB
 # ====================================================
-# ב-Render מומלץ להגדיר Persistent Disk ולמפות לנתיב הזה (או לשנות לפי הצורך)
-DB_DIR = os.getenv("DB_DIR", "/var/data")
-os.makedirs(DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(DB_DIR, os.getenv("DB_FILE", "users_data.json"))
-
-db = TinyDB(DB_PATH)
+app = Flask(__name__)
+db = TinyDB("users_data.json")
 User = Query()
 
-DB_LOCK = RLock()  # מניעת כתיבות מקבילות לאותו קובץ
-
-
 # ====================================================
-# I. מפתחות DB / קונסטנטות
+# II. Keys / Constants
 # ====================================================
-KEY_ID = "id"
-KEY_NAME = "baby_name"
-KEY_GENDER = "baby_gender"          # 'm' / 'f' (בן/בת)
-KEY_DOB = "dob"                     # "YYYY-MM-DD"
-KEY_STAGE = "stage"                 # onboarding stage
-KEY_EVENTS = "events"               # list of events
-KEY_SLEEP_START = "sleep_start_time"  # isoformat
-KEY_PENDING = "pending_action"      # dict context
-KEY_PARTNER_PHONE = "partner_phone" # normalized
-KEY_REMINDERS = "reminders"         # list[{text, due_at, created_at, done?}]
-KEY_ENC_TIERS = "enc_tier"          # dict {date_str: tier_reached}
+KEY_STAGE = "stage"
 
-MILESTONE_TIERS = {
-    4: "מדהים! עקביות זה שם המשחק. רק ארבעה אירועים ואת כבר מנצחת את היום! 🏆",
-    8: "וואו, תדעי שאת עוקבת ומנהלת את הכל בצורה מושלמת. 👏",
-    12: "את שיאנית! המערכת שלך מסודרת בזכותך. קחי נשימה עמוקה, עשית עבודה מעולה היום. ❤️",
-}
+KEY_MOM_NAME = "mom_name"
+
+KEY_BABY_NAME = "baby_name"
+KEY_BABY_GENDER = "baby_gender"  # "male" / "female"
+KEY_DOB = "dob"                  # YYYY-MM-DD
+
+KEY_EVENTS = "events"            # list of events
+KEY_PENDING = "pending_action"   # dict for follow-ups
+KEY_SLEEP_START = "sleep_start_time"  # ISO str
+KEY_PARTNER_PHONE = "partner_phone"   # normalized phone
+KEY_REMINDERS = "reminders"           # stored-only reminders (no scheduling)
 
 LEGAL_DISCLAIMER = "\n\n---\n_המידע כאן כללי ולא מחליף ייעוץ מקצועי._"
 
+# Encouragement after N actions (in a day)
+MILESTONE_TIERS = {
+    3: "איזה יופי! כבר 3 תיעודים היום — את לגמרי על זה. 💪",
+    4: "מדהים! עקביות זה שם המשחק. 4 פעולות ואת מנצחת את היום! 🏆",
+    8: "וואו, את מנהלת את זה בצורה מושלמת. 👏",
+    12: "את שיאנית! קחי נשימה עמוקה — עשית עבודה מעולה היום. ❤️",
+}
+KEY_ENC_TIER = "enc_tier"  # dict: {YYYY-MM-DD: last_tier}
+
+# Help topics (UPDATED milk storage section as requested)
 HELP_TOPICS = {
-    "menu": "איך אפשר לעזור? 🌱\n\nבחרי נושא:\n1️⃣ טיפול בחלב אם\n2️⃣ הנקה\n3️⃣ נורות אזהרה\n4️⃣ המלצות כלליות",
+    "menu": (
+        "איך אפשר לעזור? 🌱\n\n"
+        "בחרי נושא (או כתבי את המספר):\n"
+        "1️⃣ טיפול בחלב אם\n"
+        "2️⃣ דברים שחשוב לשים לב בהנקה\n"
+        "3️⃣ נורות אזהרה\n"
+        "4️⃣ המלצות כלליות להנקה\n\n"
+        "(אפשר לבחור במילים או במספר)"
+    ),
     "1": {
-        "keywords": ["חלב", "אחסון", "טיפול", "הקפאה", "קפוא", "מקרר"],
-        "text": "❄️ זמני אחסון חלב אם:\n• חדר: 3-4 שעות.\n• מקרר: 3-8 ימים.\n• מקפיא: 3-12 חודשים.\n• חלב שהופשר: 24 שעות במקרר. אין להקפיא שנית.",
+        "keywords": ["חלב", "טיפול", "אחסון", "קפוא", "מקרר", "מקפיא", "צידנית", "הפשרה", "חימום"],
+        "text": (
+            "כמה דברים חשובים על אחסון וטיפול בחלב אם 🍼\n\n"
+            "❄️ זמני אחסון (לחלב שנשאב בתנאים נקיים מאוד):\n"
+            "• בטמפרטורת החדר: מומלץ 3-4 שעות (אפשרי עד 6 שעות).\n"
+            "• חלב טרי במקרר: מומלץ 3 ימים (אפשרי עד 8 ימים).\n"
+            "• מקפיא (דלת נפרדת): מומלץ 3 חודשים (אפשרי עד 12 חודשים).\n"
+            "• צידנית + קרחונים: עד 24 שעות בצידנית, במגע עם הקרחונים.\n"
+            "• חלב קפוא שהופשר במקרר: מההפשרה 24 שעות בקירור. אין להקפיא שוב.\n"
+            "• חלב קפוא שהופשר בטמפרטורת החדר: אין להקפיא שוב ואין להחזיר למקרר.\n\n"
+            "🌡️ הפשרה וחימום:\n"
+            "• אופן ההפשרה: מומלץ להפשיר במקרר או בטמפרטורת החדר.\n"
+            "• אופן החימום: ניתן לחמם בכלי עם מים חמימים. לא רותחים ולא במיקרוגל.\n\n"
+            "*כל הנתונים הינם עבור חלב שנשאב בתנאים נקיים מאוד.*"
+        ),
     },
-    "2": {"keywords": ["בליעה", "הנקה", "תפיסה", "שד"], "text": "שימי לב לבלוע ולא רק למצוץ, ולכך שהשד מתרכך בסיום."},
-    "3": {"keywords": ["אזהרה", "נורות", "חום", "אודם", "דלקת"], "text": "🚨 נורות אזהרה: חום גבוה, אודם בשד, או פחות מ-6 חיתולים רטובים ביום."},
-    "4": {"keywords": ["המלצות", "טיפים", "מים", "שתייה"], "text": "החליפי צדדים בכל הנקה ושתי המון מים! 💧"},
+    "2": {
+        "keywords": ["בליעה", "הנקה", "תפיסה", "שד", "כאב", "פטמה", "מציצה"],
+        "text": "בהנקה: שימי לב לבליעה (ולא רק מציצה), ולכך שהשד מתרכך בסיום. אם יש כאב מתמשך — שווה לבדוק תפיסה.",
+    },
+    "3": {
+        "keywords": ["אזהרה", "נורות", "חום", "אודם", "דלקת", "פחות חיתולים"],
+        "text": "🚨 נורות אזהרה: חום גבוה, אודם/כאב משמעותי בשד, או פחות מ-6 חיתולים רטובים ביום (אחרי הימים הראשונים).",
+    },
+    "4": {
+        "keywords": ["המלצות", "טיפים", "מים", "שתייה", "צדדים"],
+        "text": "טיפים כלליים: החליפי צדדים בהנקות, שתייה מספקת, ומנוחה כשאפשר. 💧",
+    },
 }
 
-
 # ====================================================
-# II. Utilities
+# III. Time / Normalization Utilities
 # ====================================================
-def get_now_tz() -> dt.datetime:
-    return dt.datetime.now()
+def get_now_tz():
+    """
+    Render servers run in UTC. For Israel local time:
+    - This MVP uses fixed UTC+2. (For DST correctness, use zoneinfo in a later iteration.)
+    """
+    return dt.datetime.utcnow() + timedelta(hours=2)
 
-def today_str() -> str:
+def get_today_str():
     return get_now_tz().strftime("%Y-%m-%d")
 
-def yesterday_str() -> str:
-    return (get_now_tz() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-def to_int(val) -> int:
+def to_int(val):
     try:
         if isinstance(val, str):
             val = re.sub(r"[^\d]", "", val)
         return int(val)
-    except Exception:
+    except:
         return 0
 
 def normalize_phone(phone_str: str) -> str:
@@ -90,138 +122,137 @@ def normalize_phone(phone_str: str) -> str:
         clean = "972" + clean[4:]
     return clean
 
-def safe_parse_dt(ts: str) -> dt.datetime | None:
-    try:
-        return dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-def format_timedelta(delta: timedelta) -> str:
-    total_seconds = int(delta.total_seconds())
-    if total_seconds < 0:
-        total_seconds = 0
+def format_timedelta(delta: dt.timedelta) -> str:
+    total_seconds = max(0, int(delta.total_seconds()))
     hours, minutes = divmod(total_seconds // 60, 60)
     if hours > 0:
-        return f"לפני {hours} שעות ו-{minutes} דקות" if minutes > 0 else f"לפני {hours} שעות"
+        h_str = f"{hours} שעות" if hours > 1 else "שעה"
+        m_str = f" ו-{minutes} דקות" if minutes > 0 else ""
+        return f"לפני {h_str}{m_str}"
     return f"לפני {minutes} דקות"
 
-def validate_and_format_dob(dob_str: str) -> str | None:
-    # תומך גם בשנה מקוצרת
+def validate_and_format_dob(dob_str: str):
+    """
+    Accepts: dd/mm/YYYY, dd/mm/YY, YYYY-mm-dd, dd.mm.YYYY, dd.mm.YY
+    Returns: YYYY-mm-dd or None
+    """
+    s = dob_str.strip()
     for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
         try:
-            d = dt.datetime.strptime(dob_str.strip(), fmt).date()
-            if d > dt.date.today():
+            d = dt.datetime.strptime(s, fmt).date()
+            today = get_now_tz().date()
+            if d > today:
                 return None
-            # “בוט תינוקות” – עד בערך 3 שנים
-            if d < dt.date.today() - timedelta(days=1100):
+            # Baby bot: limit to ~3 years back
+            if d < today - timedelta(days=1100):
                 return None
             return d.strftime("%Y-%m-%d")
         except ValueError:
             continue
     return None
 
-def calculate_age(dob_yyyy_mm_dd: str | None) -> str:
-    if not dob_yyyy_mm_dd:
+# ====================================================
+# IV. Gender-aware text helpers
+# ====================================================
+def baby_label(user) -> str:
+    return user.get(KEY_BABY_NAME) or "הבייבי"
+
+def baby_pronoun(user) -> str:
+    return "הוא" if user.get(KEY_BABY_GENDER) == "male" else "היא"
+
+def baby_child_word(user) -> str:
+    return "בן" if user.get(KEY_BABY_GENDER) == "male" else "בת"
+
+def verb_sleep(user) -> str:
+    return "ישן" if user.get(KEY_BABY_GENDER) == "male" else "ישנה"
+
+def verb_awake(user) -> str:
+    return "ער" if user.get(KEY_BABY_GENDER) == "male" else "ערה"
+
+def calculate_age(dob_str, user=None) -> str:
+    if not dob_str:
         return ""
     try:
-        birth_date = dt.datetime.strptime(dob_yyyy_mm_dd, "%Y-%m-%d").date()
-        diff = dt.date.today() - birth_date
-        if diff.days < 30:
-            return f"בן {diff.days} ימים"  # גיל תינוק קטן
-        return f"בן {diff.days // 30} חודשים"
-    except Exception:
+        birth_date = dt.datetime.strptime(dob_str, "%Y-%m-%d").date()
+        diff_days = (get_now_tz().date() - birth_date).days
+        g = baby_child_word(user) if user else "בן/בת"
+        if diff_days < 30:
+            return f"{g} {diff_days} ימים"
+        return f"{g} {diff_days // 30} חודשים"
+    except:
         return ""
 
-def baby_pronouns(user: dict) -> dict:
-    """
-    מחזיר מונחים בעברית בהתאם למגדר:
-    - he_she: "הוא"/"היא"
-    - son_daughter: "בן"/"בת"
-    - ate: "אכל"/"אכלה"
-    - slept: "ישן"/"ישנה"
-    """
-    g = (user.get(KEY_GENDER) or "").lower().strip()
-    if g == "f":
-        return {"he_she": "היא", "son_daughter": "בת", "ate": "אכלה", "slept": "ישנה"}
-    # ברירת מחדל זכר
-    return {"he_she": "הוא", "son_daughter": "בן", "ate": "אכל", "slept": "ישן"}
+# ====================================================
+# V. DB access helpers
+# ====================================================
+def get_user_by_uid(uid_norm: str):
+    return db.get(User.id == uid_norm) or db.get(User[KEY_PARTNER_PHONE] == uid_norm)
 
+def ensure_events_list(user):
+    if not isinstance(user.get(KEY_EVENTS), list):
+        user[KEY_EVENTS] = []
+
+def add_event(user_id, event_type, details_dict, timestamp=None):
+    uid = normalize_phone(user_id)
+    user = get_user_by_uid(uid)
+    if not user:
+        return None
+
+    ts = timestamp or get_now_tz().strftime("%Y-%m-%d %H:%M:%S")
+    event = {"type": event_type, "timestamp": ts, "details": details_dict or {}}
+
+    ensure_events_list(user)
+    user[KEY_EVENTS].append(event)
+    db.upsert(user, User.id == user["id"])
+    return event
+
+def get_last_event(user, types):
+    events = user.get(KEY_EVENTS, []) or []
+    for e in reversed(events):
+        if e.get("type") in types:
+            return e
+    return None
 
 # ====================================================
-# III. DB Access (with lock)
+# VI. Human formatting + summaries
 # ====================================================
-def get_user_by_uid(uid_norm: str) -> dict | None:
-    with DB_LOCK:
-        user = db.get(User[KEY_ID] == uid_norm)
-        if not user:
-            user = db.get(User[KEY_PARTNER_PHONE] == uid_norm)
-        return user
-
-def upsert_user(user: dict) -> None:
-    with DB_LOCK:
-        db.upsert(user, User[KEY_ID] == user[KEY_ID])
-
-def remove_user(uid_norm: str) -> None:
-    with DB_LOCK:
-        u = db.get(User[KEY_ID] == uid_norm) or db.get(User[KEY_PARTNER_PHONE] == uid_norm)
-        if u:
-            db.remove(User[KEY_ID] == u[KEY_ID])
-
-def add_event(user_id_norm: str, event_type: str, details: dict, timestamp: str | None = None) -> dict | None:
-    with DB_LOCK:
-        user = get_user_by_uid(user_id_norm)
-        if not user:
-            return None
-        ts = timestamp or get_now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        event = {"type": event_type, "timestamp": ts, "details": details or {}}
-
-        if not isinstance(user.get(KEY_EVENTS), list):
-            user[KEY_EVENTS] = []
-        user[KEY_EVENTS].append(event)
-        db.upsert(user, User[KEY_ID] == user[KEY_ID])
-        return event
-
-
-# ====================================================
-# IV. Formatting
-# ====================================================
-def format_event_human(user: dict, event: dict) -> str:
+def format_event_human(event):
     etype = event.get("type")
-    d = event.get("details", {})
+    d = event.get("details", {}) or {}
     time = (event.get("timestamp") or "")[-8:-3]
-    p = baby_pronouns(user)
 
     if etype == "breastfeeding":
-        side = d.get("side", "לא צוין")
         dur = d.get("duration")
         dur_txt = f"{dur} דק'" if dur else "ללא משך"
-        return f"🤱 הנקה: צד {side} ({dur_txt}) ב-{time}"
+        side = d.get("side", "לא צוין")
+        return f"🤱 הנקה מצד {side} ({dur_txt}) ב-{time}"
     if etype == "bottle":
-        return f"🍼 בקבוק: {d.get('amount', 0)} מ״ל ב-{time}"
+        return f"🍼 בקבוק {d.get('amount', 0)} מ״ל ב-{time}"
+    if etype == "pumping":
+        amt = d.get("amount", 0)
+        side = d.get("side", "לא צוין")
+        return f"🧴 שאיבה {amt} מ״ל ({side}) ב-{time}" if amt else f"🧴 שאיבה ({side}) ב-{time}"
     if etype == "diaper":
-        return f"🧷 חיתול: {d.get('type', 'החלפה')} ב-{time}"
+        return f"🧷 חיתול ({d.get('type', 'החלפה')}) ב-{time}"
     if etype == "sleep":
         if "duration_min" in d:
-            return f"😴 שינה: {p['slept']} {d['duration_min']} דק' (הסתיימה ב-{time})"
+            return f"😴 שינה של {d['duration_min']} דק' (הסתיימה ב-{time})"
         return f"☀️ יקיצה ב-{time}"
     return f"✨ {etype} ב-{time}"
 
-
-# ====================================================
-# V. Insights / Summaries / Comparisons
-# ====================================================
-def iter_recent_events(events: list, cutoff_dt: dt.datetime):
-    # סריקה מהסוף – יעיל כשמוסיפים אירועים בסוף
-    for e in reversed(events):
-        e_dt = safe_parse_dt(e.get("timestamp", ""))
-        if not e_dt:
+def iter_recent_events(events, cutoff_dt):
+    # Efficient scan from end
+    for e in reversed(events or []):
+        try:
+            e_dt = dt.datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S")
+            if e_dt < cutoff_dt:
+                break
+            yield e
+        except:
             continue
-        if e_dt < cutoff_dt:
-            break
-        yield e
 
-def get_summary(user: dict, hours: int | None = None) -> str:
-    events = user.get(KEY_EVENTS, [])
+def get_summary(user, hours=None):
+    events = user.get(KEY_EVENTS, []) or []
     now = get_now_tz()
 
     if hours is None:
@@ -236,579 +267,633 @@ def get_summary(user: dict, hours: int | None = None) -> str:
         return f"לא מצאתי אירועים {label}."
 
     bottles = sum(to_int(e.get("details", {}).get("amount", 0)) for e in relevant if e.get("type") == "bottle")
-    breasts = sum(1 for e in relevant if e.get("type") == "breastfeeding")
-    diapers = sum(1 for e in relevant if e.get("type") == "diaper")
+    pumps = sum(to_int(e.get("details", {}).get("amount", 0)) for e in relevant if e.get("type") == "pumping")
+    breasts = len([e for e in relevant if e.get("type") == "breastfeeding"])
+    diapers = len([e for e in relevant if e.get("type") == "diaper"])
     sleep_mins = sum(to_int(e.get("details", {}).get("duration_min", 0)) for e in relevant if e.get("type") == "sleep")
 
-    res = f"📊 *סיכום {label}:*\n"
+    res = f"📊 *סיכום {label} עבור {baby_label(user)}:*\n"
     res += f"🍼 בקבוקים: {bottles} מ״ל\n"
+    if pumps > 0:
+        res += f"🧴 שאיבות: {pumps} מ״ל\n"
     res += f"🤱 הנקות: {breasts}\n"
     res += f"🧷 חיתולים: {diapers}\n"
     res += f"😴 שינה: {sleep_mins // 60} שע' ו-{sleep_mins % 60} דק'"
     return res
 
-def get_comparison_report(user: dict) -> str:
-    events = user.get(KEY_EVENTS, [])
-    t, y = today_str(), yesterday_str()
-
-    def summarize(date_str: str) -> dict:
-        day_events = [e for e in events if (e.get("timestamp", "").startswith(date_str))]
-        return {
-            "breast": sum(1 for e in day_events if e.get("type") == "breastfeeding"),
-            "bottle": sum(to_int(e.get("details", {}).get("amount", 0)) for e in day_events if e.get("type") == "bottle"),
-            "diaper": sum(1 for e in day_events if e.get("type") == "diaper"),
-            "sleep_mins": sum(to_int(e.get("details", {}).get("duration_min", 0)) for e in day_events if e.get("type") == "sleep"),
-        }
-
-    s_t, s_y = summarize(t), summarize(y)
-    report = f"📊 השוואה עבור {user.get(KEY_NAME, 'הבייבי')}:\n\n"
-    report += f"🤱 הנקות: {s_t['breast']} (אתמול: {s_y['breast']})\n"
-    report += f"🍼 בקבוקים: {s_t['bottle']} מ\"ל (אתמול: {s_y['bottle']} מ\"ל)\n"
-    report += f"🧷 חיתולים: {s_t['diaper']} (אתמול: {s_y['diaper']})\n"
-    report += f"😴 שינה: {round(s_t['sleep_mins']/60, 1)} שע' (אתמול: {round(s_y['sleep_mins']/60, 1)} שע')"
-    return report
-
-def get_health_insights(user: dict) -> str | None:
-    """
-    דוגמה קלה: חיתולים עד השעה הזו בהשוואה לממוצע 3 ימים קודמים עד אותה שעה
-    (זה "רמז" בלבד, לא המלצה רפואית).
-    """
-    events = user.get(KEY_EVENTS, [])
+# ====================================================
+# VII. Smart insights (no scheduling)
+# ====================================================
+def smart_insights(user):
+    insights = []
     now = get_now_tz()
-    current_time = now.time()
 
-    diaper_dts = []
-    for e in events:
-        if e.get("type") != "diaper":
-            continue
-        e_dt = safe_parse_dt(e.get("timestamp", ""))
-        if e_dt:
-            diaper_dts.append(e_dt)
+    # Feed: bottle or breastfeeding
+    last_feed = get_last_event(user, ["bottle", "breastfeeding"])
+    if last_feed:
+        try:
+            ts = dt.datetime.strptime(last_feed["timestamp"], "%Y-%m-%d %H:%M:%S")
+            mins = int((now - ts).total_seconds() / 60)
+            if mins >= 180:
+                insights.append(f"💡 עברו בערך {mins//60} שעות מאז ההאכלה האחרונה.")
+        except:
+            pass
 
-    today_count = sum(1 for d in diaper_dts if d.date() == now.date() and d.time() <= current_time)
+    # Pumping insight (optional)
+    last_pump = get_last_event(user, ["pumping"])
+    if last_pump:
+        try:
+            ts = dt.datetime.strptime(last_pump["timestamp"], "%Y-%m-%d %H:%M:%S")
+            mins = int((now - ts).total_seconds() / 60)
+            if mins >= 240:
+                insights.append(f"💡 עברו בערך {mins//60} שעות מאז השאיבה האחרונה.")
+        except:
+            pass
 
-    past_counts = []
-    for i in range(1, 4):
-        target_date = (now - timedelta(days=i)).date()
-        count = sum(1 for d in diaper_dts if d.date() == target_date and d.time() <= current_time)
-        past_counts.append(count)
+    # Diaper
+    last_diaper = get_last_event(user, ["diaper"])
+    if last_diaper:
+        try:
+            ts = dt.datetime.strptime(last_diaper["timestamp"], "%Y-%m-%d %H:%M:%S")
+            mins = int((now - ts).total_seconds() / 60)
+            if mins >= 240:
+                insights.append(f"💡 עברו בערך {mins//60} שעות מאז החיתול האחרון.")
+        except:
+            pass
 
-    if not past_counts:
-        return None
+    # Awake time (based on last sleep end_ts)
+    last_sleep = get_last_event(user, ["sleep"])
+    if last_sleep and last_sleep.get("details", {}).get("end_ts"):
+        try:
+            ts = dt.datetime.strptime(last_sleep["details"]["end_ts"], "%Y-%m-%d %H:%M:%S")
+            mins = int((now - ts).total_seconds() / 60)
+            if mins >= 120:
+                insights.append(
+                    f"💡 {baby_label(user)} {verb_awake(user)} כבר בערך {mins//60} שעות (התעורר/ה ב-{ts.strftime('%H:%M')})."
+                )
+        except:
+            pass
 
-    avg_past = sum(past_counts) / len(past_counts)
-    if avg_past > 1.5 and today_count <= (avg_past * 0.4):
-        return f"💡 שמתי לב שעד השעה הזו בדרך כלל יש יותר חיתולים ({round(avg_past,1)} בממוצע לעומת {today_count} היום). שווה לעקוב."
+    return insights
+
+# ====================================================
+# VIII. Milestone encouragement (after actions)
+# ====================================================
+def maybe_add_milestone_message(user):
+    today = get_today_str()
+    events = user.get(KEY_EVENTS, []) or []
+    today_count = sum(1 for e in events if (e.get("timestamp", "").startswith(today)))
+
+    tiers = user.get(KEY_ENC_TIER, {}) or {}
+    last_t = tiers.get(today, 0)
+
+    # trigger smallest tier not yet triggered
+    for t in sorted(MILESTONE_TIERS.keys()):
+        if today_count >= t and last_t < t:
+            tiers[today] = t
+            user[KEY_ENC_TIER] = tiers
+            db.upsert(user, User.id == user["id"])
+            return MILESTONE_TIERS[t]
     return None
 
-
 # ====================================================
-# VI. Reminders (no scheduling – shown on demand)
+# IX. NLP / Parsing
 # ====================================================
-def add_reminder(user: dict, text: str, hours_from_now: int = 0) -> None:
-    now = get_now_tz()
-    due_at = now + timedelta(hours=hours_from_now)
-    rem = {
-        "text": text.strip(),
-        "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "due_at": due_at.strftime("%Y-%m-%d %H:%M:%S"),
-        "done": False,
-    }
-    reminders = user.get(KEY_REMINDERS, [])
-    if not isinstance(reminders, list):
-        reminders = []
-    reminders.append(rem)
-    user[KEY_REMINDERS] = reminders
-    upsert_user(user)
+def clean_msg(s: str) -> str:
+    # keep hebrew/letters/digits/whitespace/newlines; remove most punctuation/emoji
+    return re.sub(r"[^\w\s\u0590-\u05FF\n]", "", (s or "").lower()).strip()
 
-def list_due_reminders(user: dict) -> str | None:
-    now = get_now_tz()
-    reminders = user.get(KEY_REMINDERS, [])
-    if not isinstance(reminders, list) or not reminders:
-        return None
+def parse_breastfeeding_multiline(msg_raw: str):
+    """
+    Supports:
+      "ימין 10 דק"
+      "ימין 10\nשמאל 10"
+      "שמאל 12"
+    Returns list[{"side":..., "duration":...}]
+    """
+    lines = [clean_msg(x) for x in (msg_raw or "").splitlines() if clean_msg(x)]
+    items = []
+    for line in lines:
+        if any(w in line for w in ["ימין", "שמאל"]):
+            side = "ימין" if "ימין" in line else "שמאל" if "שמאל" in line else "לא צוין"
+            m = re.search(r"(\d+)", line)
+            dur = to_int(m.group(1)) if m else 0
+            items.append({"side": side, "duration": dur})
+    return items
 
-    due = []
-    for r in reminders:
-        if r.get("done"):
-            continue
-        due_at = safe_parse_dt(r.get("due_at", ""))
-        if due_at and due_at <= now:
-            due.append(r)
+def parse_input(message_raw: str, user):
+    msg = clean_msg(message_raw)
 
-    if not due:
-        return None
-
-    lines = ["⏰ *תזכורות שהגיע הזמן אליהן:*"]
-    for i, r in enumerate(due[-10:], start=1):
-        lines.append(f"{i}. {r.get('text', '')}")
-    lines.append("\nכדי לסמן שבוצע: כתבי `סיימתי 1` (או מספר אחר).")
-    return "\n".join(lines)
-
-def mark_reminder_done(user: dict, idx_from_end_1based: int) -> str:
-    reminders = user.get(KEY_REMINDERS, [])
-    if not isinstance(reminders, list) or not reminders:
-        return "אין תזכורות במערכת."
-
-    # אנחנו מציגים תמיד מהסוף (האחרונות רלוונטיות), אז 1 = האחרונה שלא בוצעה שמוצגת
-    open_items = [r for r in reminders if not r.get("done")]
-    if not open_items:
-        return "אין תזכורות פתוחות."
-
-    if idx_from_end_1based < 1 or idx_from_end_1based > len(open_items):
-        return "לא מצאתי תזכורת במספר הזה."
-
-    target = open_items[-idx_from_end_1based]
-    target["done"] = True
-
-    # צריך לעדכן את הרשימה המקורית (אותו dict reference לרוב יספיק, אבל נעשה בטוח)
-    upsert_user(user)
-    return "סימנתי כבוצע ✅"
-
-
-# ====================================================
-# VII. NLP / Parsing
-# ====================================================
-def clean_msg(message: str) -> str:
-    # ניקוי פיסוק/אימוג'י, משאיר עברית/אנגלית/ספרות ורווחים
-    return re.sub(r"[^\w\s\u0590-\u05FF]", "", message.lower()).strip()
-
-def parse_input(message: str, user: dict) -> dict:
-    msg = clean_msg(message)
-
-    # ---- system commands ----
+    # Help menu selection by number
+    if msg in ["1", "2", "3", "4"]:
+        return {"type": "help_item", "id": msg}
     if msg in ["עזרה", "help", "menu", "תפריט"]:
         return {"type": "help_menu"}
 
-    if msg in ["השוואה", "השווא"]:
-        return {"type": "comparison"}
-
-    if msg.startswith("סיכום"):
-        # "סיכום" / "סיכום 12" / "סיכום 24"
-        m = re.search(r"סיכום\s*(\d+)?", msg)
-        hours = to_int(m.group(1)) if (m and m.group(1)) else None
-        return {"type": "summary", "hours": hours}
-
+    # Undo
     if any(w in msg for w in ["בטל", "מחק", "טעות", "undo"]):
         return {"type": "undo"}
 
-    if msg == "סטטוס":
+    # Status / Summary
+    if any(w in msg for w in ["סטטוס", "מצב"]):
         return {"type": "status"}
+    if "סיכום" in msg:
+        h = to_int(re.search(r"\d+", msg).group(0)) if re.search(r"\d+", msg) else None
+        return {"type": "summary", "hours": h}
 
-    if msg == "תזכורות":
-        return {"type": "reminders_list"}
-
-    # "סיימתי 1"
-    m_done = re.search(r"סיימתי\s*(\d+)", msg)
-    if m_done:
-        return {"type": "reminder_done", "idx": to_int(m_done.group(1))}
-
-    # ---- pending completion ----
-    pending = user.get(KEY_PENDING)
-    if pending and msg.isdigit():
-        val = to_int(msg)
-        if pending.get("type") == "bottle":
-            return {"type": "bottle", "amount": val}
-        if pending.get("type") == "breastfeeding":
-            return {"type": "breastfeeding", "side": pending.get("side", "לא צוין"), "duration": val}
-        if pending.get("type") == "sleep_manual":
-            return {"type": "sleep_manual", "duration": val}
-
-    # ---- help topics by number ----
-    if msg in ["1", "2", "3", "4"]:
-        return {"type": "help_item", "id": msg}
-
-    # ---- smart help by keywords ----
-    best_id, best_score = None, 0
-    for tid, content in HELP_TOPICS.items():
-        if not isinstance(content, dict):
-            continue
-        score = sum(1 for kw in content.get("keywords", []) if kw in msg)
-        if score > best_score:
-            best_score, best_id = score, tid
-    if best_id and best_score > 0:
-        return {"type": "help_item", "id": best_id}
-
-    # ---- "מתי" queries ----
+    # "מתי" queries
     if "מתי" in msg:
-        if any(w in msg for w in ["אכל", "אכלה", "בקבוק", "הנקה"]):
+        if any(w in msg for w in ["אכל", "אכלה", "בקבוק", "הנקה", "האכלה"]):
             return {"type": "query_last", "targets": ["bottle", "breastfeeding"], "label": "האכילה"}
+        if any(w in msg for w in ["שאב", "שאבה", "שאיבה"]):
+            return {"type": "query_last", "targets": ["pumping"], "label": "השאיבה"}
         if any(w in msg for w in ["חיתול", "החלפנו", "קקי", "פיפי"]):
-            return {"type": "query_last", "targets": ["diaper"], "label": "החלפת החיתול"}
-        if any(w in msg for w in ["נרדם", "ישן", "ישנה"]):
-            # לשינה נרצה start/end אם יש
-            return {"type": "query_last", "targets": ["sleep"], "label": "השינה", "sub_type": "end"}
+            return {"type": "query_last", "targets": ["diaper"], "label": "החיתול"}
+        if any(w in msg for w in ["נרדם", "ישן", "שינה"]):
+            return {"type": "query_last", "targets": ["sleep"], "sub_type": "start", "label": "השינה"}
 
+    # Awake time
     if any(w in msg for w in ["כמה זמן ער", "חלון ערות", "זמן ערות"]):
         return {"type": "query_awake"}
 
-    # ---- reminders add ----
-    # "תזכורת חיסון עוד 48 שעות" / "תזכורת תרופה עוד 2 שעות"
-    if msg.startswith("תזכורת"):
-        # מחפש "עוד X שעות"
-        m = re.search(r"עוד\s*(\d+)\s*שעות?", msg)
-        hrs = to_int(m.group(1)) if m else 0
-        text = msg.replace("תזכורת", "").strip()
-        if m:
-            text = re.sub(r"עוד\s*\d+\s*שעות?", "", text).strip()
-        if not text:
-            text = "תזכורת"
-        return {"type": "add_reminder", "text": text, "hours": hrs}
-
-    # ---- sleep ----
-    if any(w in msg for w in ["נרדם", "הלך לישון", "נכנס לישון", "התחיל לישון"]):
-        return {"type": "sleep_start"}
-
-    if any(w in msg for w in ["קם", "התעורר", "סיים לישון"]):
-        return {"type": "sleep_end"}
-
-    # manual sleep: "ישן 40 דקות"
-    m_sleep = re.search(r"(ישן|ישנה)\s*(\d+)\s*(דקות|דק)", msg)
-    if m_sleep:
-        return {"type": "sleep_manual", "duration": to_int(m_sleep.group(2))}
-    # "ישן" בלי מספר
-    if any(w in msg for w in ["ישן", "ישנה"]) and not any(w in msg for w in ["נרדם", "קם", "התעורר"]):
-        return {"type": "sleep_manual", "duration": 0}
-
-    # ---- breastfeeding ----
-    if any(k in msg for k in ["ינק", "הנקה", "ימין", "שמאל"]):
-        side = "ימין" if "ימין" in msg else "שמאל" if "שמאל" in msg else "לא צוין"
-        dur_match = re.search(r"(\d+)\s*(דקות|דק)", msg)
-        dur = to_int(dur_match.group(1)) if dur_match else to_int(re.search(r"\d+", msg).group(0)) if re.search(r"\d+", msg) else 0
-        return {"type": "breastfeeding", "side": side, "duration": dur}
-
-    # ---- bottle ----
-    if "בקבוק" in msg:
-        amt_match = re.search(r"(\d+)\s*(מ\"ל|מ״ל|מל|ml)", msg)
-        amt = to_int(amt_match.group(1)) if amt_match else to_int(re.search(r"\d+", msg).group(0)) if re.search(r"\d+", msg) else 0
-        return {"type": "bottle", "amount": amt}
-
-    # ---- diaper ----
-    if any(w in msg for w in ["קקי", "פיפי", "חיתול"]):
-        dtype = "קקי" if "קקי" in msg else "פיפי" if "פיפי" in msg else "שניהם"
-        return {"type": "diaper", "diaper_type": dtype}
-
-    # ---- partner ----
+    # Partner add
     if any(w in msg for w in ["הוסף בן זוג", "הוסיפי בן זוג", "הוסף בןזוג", "הוסיפי בןזוג"]):
         phone = re.search(r"(05\d{8}|9725\d{8})", msg)
         return {"type": "add_partner", "phone": phone.group(0) if phone else None}
 
+    # Pumping
+    if any(w in msg for w in ["שאיבה", "שאבתי", "שאבה", "שואבת", "שאוב", "לשאוב"]):
+        # try amount
+        m = re.search(r"(\d+)", msg)
+        amt = to_int(m.group(1)) if m else 0
+        side = "שני הצדדים" if "שני" in msg else ("ימין" if "ימין" in msg else ("שמאל" if "שמאל" in msg else "לא צוין"))
+        return {"type": "pumping", "amount": amt, "side": side}
+
+    # Breastfeeding (supports multiline)
+    if any(w in msg for w in ["הנקה", "ינק", "ימין", "שמאל"]):
+        items = parse_breastfeeding_multiline(message_raw)
+        if items:
+            return {"type": "breastfeeding_multi", "items": items}
+        # fallback single
+        side = "ימין" if "ימין" in msg else "שמאל" if "שמאל" in msg else "לא צוין"
+        m = re.search(r"(\d+)", msg)
+        dur = to_int(m.group(1)) if m else 0
+        return {"type": "breastfeeding", "side": side, "duration": dur}
+
+    # Bottle
+    if "בקבוק" in msg:
+        m = re.search(r"(\d+)", msg)
+        amt = to_int(m.group(1)) if m else 0
+        return {"type": "bottle", "amount": amt}
+
+    # Diaper
+    if any(w in msg for w in ["קקי", "פיפי", "חיתול"]):
+        if "קקי" in msg and "פיפי" in msg:
+            t = "מלא"
+        elif "קקי" in msg:
+            t = "קקי"
+        elif "פיפי" in msg:
+            t = "פיפי"
+        else:
+            t = "החלפה"
+        return {"type": "diaper", "diaper_type": t}
+
+    # Sleep
+    if any(w in msg for w in ["נרדם", "הלך לישון", "נכנס לישון", "התחיל לישון"]):
+        return {"type": "sleep_start"}
+    if any(w in msg for w in ["קם", "התעורר", "סיים לישון", "התעוררה"]):
+        return {"type": "sleep_end"}
+    # manual sleep: "ישן 40" / "ישנה 30 דקות"
+    if any(w in msg for w in ["ישן", "ישנה"]) and re.search(r"\d+", msg):
+        m = re.search(r"(\d+)", msg)
+        return {"type": "sleep_manual", "duration": to_int(m.group(1))}
+
+    # Pending answer numeric (for bottle/breast/pump/manual sleep)
+    pending = user.get(KEY_PENDING)
+    if pending and msg.isdigit():
+        val = to_int(msg)
+        if pending["type"] == "bottle":
+            return {"type": "bottle", "amount": val, "_from_pending": True}
+        if pending["type"] == "breastfeeding":
+            return {"type": "breastfeeding", "side": pending.get("side", "לא צוין"), "duration": val, "_from_pending": True}
+        if pending["type"] == "pumping":
+            return {"type": "pumping", "amount": val, "side": pending.get("side", "לא צוין"), "_from_pending": True}
+        if pending["type"] == "sleep_manual":
+            return {"type": "sleep_manual", "duration": val, "_from_pending": True}
+
     return {"type": "unknown"}
 
+# ====================================================
+# X. Registration flow messages
+# ====================================================
+def reg_message_stage_1():
+    return (
+        "היי! 👋 אני בילי...\n"
+        "אני פה כדי לעזור לך לתעד ולהקל עלייך בחודשים הראשונים! 🤱\n\n"
+        "את אלופה! ❤️ כדי שנתחיל — איך קוראים לך?"
+    )
+
+def reg_message_stage_2(mom_name):
+    return f"נעים מאוד {mom_name} 😊\nאיך קוראים לבייבי?"
+
+def reg_message_stage_3(baby_name):
+    return (
+        f"איזה שם מתוק — {baby_name} 🥰\n"
+        "מה מין היילוד?\n"
+        "כתבי:\n"
+        "1) בן\n"
+        "2) בת"
+    )
+
+def reg_message_stage_4():
+    return (
+        "מעולה! ומה תאריך הלידה? 📅\n"
+        "אפשר למשל: 01/01/2025"
+    )
+
+def after_registration_welcome(user):
+    mom = user.get(KEY_MOM_NAME, "")
+    baby = baby_label(user)
+    return (
+        f"{mom} מהממת ❤️ סיימנו הרשמה!\n\n"
+        "אני פה כדי לשמור לך על כל המידע החשוב בצורה מסודרת.\n\n"
+        "איך מתעדים?\n"
+        "🤱 הנקה:\n"
+        "• 'ימין 10'\n"
+        "• אפשר גם ריבוי שורות:\n"
+        "  ימין 10\n"
+        "  שמאל 8\n\n"
+        "🍼 בקבוק:\n"
+        "• 'בקבוק 120'\n\n"
+        "🧴 שאיבה:\n"
+        "• 'שאיבה 80'\n"
+        "• אפשר גם צד: 'שאיבה ימין 60'\n\n"
+        "🧷 חיתול:\n"
+        "• 'פיפי' / 'קקי' / 'חיתול'\n\n"
+        "😴 שינה:\n"
+        "• 'נרדם' / 'התעורר'\n\n"
+        f"בכל רגע אפשר לכתוב 'סטטוס' ותקבלי תמונת מצב על {baby}.\n"
+        "לעזרה: כתבי 'עזרה'."
+    )
 
 # ====================================================
-# VIII. Business Logic
+# XI. Core handler
 # ====================================================
-def get_last_event(user: dict, types: list[str]) -> dict | None:
-    events = user.get(KEY_EVENTS, [])
-    filtered = [e for e in events if e.get("type") in types]
-    if not filtered:
-        return None
-    # מיון לפי timestamp טקסטואלי עובד כי פורמט אחיד YYYY-MM-DD HH:MM:SS
-    return sorted(filtered, key=lambda x: x.get("timestamp", ""))[-1]
+def handle_command(uid, user, parsed):
+    replies = []
 
-def apply_milestones(user: dict) -> list[str]:
-    # מחזיר הודעת עידוד אם צריך
-    events = user.get(KEY_EVENTS, [])
-    today = today_str()
-    count = sum(1 for e in events if (e.get("timestamp", "").startswith(today)))
-
-    tiers = user.get(KEY_ENC_TIERS, {})
-    if not isinstance(tiers, dict):
-        tiers = {}
-
-    last_t = to_int(tiers.get(today, 0))
-    for t in sorted(MILESTONE_TIERS.keys()):
-        if count >= t and t > last_t:
-            tiers[today] = t
-            user[KEY_ENC_TIERS] = tiers
-            upsert_user(user)
-            return [MILESTONE_TIERS[t]]
-    return []
-
-def handle_logging(uid_norm: str, parsed: dict, user: dict) -> list[str]:
-    baby = user.get(KEY_NAME, "הבייבי")
-    p = baby_pronouns(user)
-    res: list[str] = []
-
-    # ברירת מחדל: אם התקבלה פקודה “אמיתית”, מאפסים pending
-    if parsed.get("type") not in ("unknown",):
+    # Clear pending by default when a valid command comes (except unknown)
+    if parsed["type"] != "unknown":
         user[KEY_PENDING] = None
 
-    t = parsed["type"]
+    baby = baby_label(user)
 
-    # ---- undo ----
-    if t == "undo":
+    # HELP
+    if parsed["type"] == "help_menu":
+        replies.append(HELP_TOPICS["menu"])
+        return replies
+
+    if parsed["type"] == "help_item":
+        item = HELP_TOPICS.get(parsed["id"])
+        if item and "text" in item:
+            replies.append(item["text"] + LEGAL_DISCLAIMER)
+        else:
+            replies.append("לא מצאתי את הנושא הזה. כתבי 'עזרה' כדי לראות תפריט.")
+        return replies
+
+    # UNDO
+    if parsed["type"] == "undo":
         if user.get(KEY_PENDING):
             user[KEY_PENDING] = None
-            upsert_user(user)
-            return ["ביטלתי את השאלה האחרונה. 👍"]
+            db.upsert(user, User.id == user["id"])
+            replies.append("ביטלתי את השאלה האחרונה. 👍")
+            return replies
 
-        events = user.get(KEY_EVENTS, [])
+        events = user.get(KEY_EVENTS, []) or []
         if events:
             removed = events.pop()
             user[KEY_EVENTS] = events
-            upsert_user(user)
-            return [f"ביטלתי את הרישום האחרון: *{format_event_human(user, removed)}*"]
-        return ["אין לי מה לבטל."]
+            db.upsert(user, User.id == user["id"])
+            replies.append(f"ביטלתי את הרישום האחרון: *{format_event_human(removed)}*")
+        else:
+            replies.append("אין לי מה לבטל.")
+        return replies
 
-    # ---- sleep start/end/manual ----
-    if t == "sleep_start":
+    # STATUS
+    if parsed["type"] == "status":
+        age = calculate_age(user.get(KEY_DOB), user=user)
+        replies.append(f"📍 סטטוס {baby} ({age})\n")
+        replies.append(get_summary(user, hours=None))
+        tips = smart_insights(user)
+        replies.extend(tips)
+        return replies
+
+    # SUMMARY
+    if parsed["type"] == "summary":
+        replies.append(get_summary(user, hours=parsed.get("hours")))
+        tips = smart_insights(user)
+        replies.extend(tips)
+        return replies
+
+    # QUERY_LAST
+    if parsed["type"] == "query_last":
+        events = user.get(KEY_EVENTS, []) or []
+        targets = parsed["targets"]
+
+        filtered = [e for e in events if e.get("type") in targets]
+        if parsed.get("sub_type") == "start":
+            filtered = [e for e in filtered if "start_ts" in (e.get("details", {}) or {})]
+            key_func = lambda x: (x.get("details", {}) or {}).get("start_ts", x.get("timestamp", ""))
+            ts_format = "%Y-%m-%d %H:%M:%S"
+            if filtered:
+                last = sorted(filtered, key=key_func)[-1]
+                ts_str = key_func(last)
+                try:
+                    ts = dt.datetime.strptime(ts_str, ts_format)
+                    replies.append(f"{parsed['label']} האחרונה הייתה {format_timedelta(get_now_tz()-ts)} ({ts.strftime('%H:%M')}).")
+                except:
+                    replies.append(f"מצאתי תיעוד של {parsed['label']}, אבל לא הצלחתי לפענח את הזמן.")
+            else:
+                replies.append(f"לא מצאתי תיעוד של {parsed['label']}.")
+            return replies
+
+        # default: use event timestamp
+        if filtered:
+            last = sorted(filtered, key=lambda x: x.get("timestamp", ""))[-1]
+            try:
+                ts = dt.datetime.strptime(last["timestamp"], "%Y-%m-%d %H:%M:%S")
+                replies.append(f"{parsed['label']} האחרונה הייתה {format_timedelta(get_now_tz()-ts)} ({ts.strftime('%H:%M')}).")
+            except:
+                replies.append(f"מצאתי תיעוד של {parsed['label']}, אבל לא הצלחתי לפענח את הזמן.")
+        else:
+            replies.append(f"לא מצאתי תיעוד של {parsed['label']}.")
+        return replies
+
+    # QUERY_AWAKE
+    if parsed["type"] == "query_awake":
+        events = user.get(KEY_EVENTS, []) or []
+        sleeps = [e for e in events if e.get("type") == "sleep" and (e.get("details", {}) or {}).get("end_ts")]
+        if sleeps:
+            last_sleep = sorted(sleeps, key=lambda x: (x.get("details", {}) or {}).get("end_ts", ""))[-1]
+            try:
+                end_dt = dt.datetime.strptime(last_sleep["details"]["end_ts"], "%Y-%m-%d %H:%M:%S")
+                diff = format_timedelta(get_now_tz() - end_dt).replace("לפני ", "")
+                replies.append(f"{baby} {verb_awake(user)} כבר {diff}. ⏰")
+            except:
+                replies.append("מצאתי תיעוד שינה, אבל לא הצלחתי לחשב זמן ערות.")
+        else:
+            replies.append("אין לי תיעוד של יקיצה אחרונה.")
+        return replies
+
+    # ADD_PARTNER
+    if parsed["type"] == "add_partner":
+        if parsed.get("phone"):
+            p_uid = normalize_phone(parsed["phone"])
+            user[KEY_PARTNER_PHONE] = p_uid
+            db.upsert(user, User.id == user["id"])
+            replies.append(f"הוספתי בן/בת זוג (מספר: {p_uid}) 🤝")
+        else:
+            replies.append("לא מצאתי מספר תקין. נסי: 'הוסף בן זוג 0501234567'")
+        return replies
+
+    # LOGGING: BOTTLE
+    if parsed["type"] == "bottle":
+        amt = to_int(parsed.get("amount", 0))
+        if amt > 0:
+            add_event(uid, "bottle", {"amount": amt})
+            replies.append(f"נרשם בקבוק של {amt} מ״ל. 🍼")
+        else:
+            user[KEY_PENDING] = {"type": "bottle"}
+            db.upsert(user, User.id == user["id"])
+            replies.append(f"כמה מ״ל {baby} אכל/ה?")
+        # encouragement
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+        return replies
+
+    # LOGGING: PUMPING
+    if parsed["type"] == "pumping":
+        amt = to_int(parsed.get("amount", 0))
+        side = parsed.get("side", "לא צוין")
+        if amt > 0:
+            add_event(uid, "pumping", {"amount": amt, "side": side})
+            replies.append(f"נרשמה שאיבה של {amt} מ״ל ({side}). 🧴")
+        else:
+            user[KEY_PENDING] = {"type": "pumping", "side": side}
+            db.upsert(user, User.id == user["id"])
+            replies.append("כמה מ״ל שאבת?")
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+        return replies
+
+    # LOGGING: BREASTFEEDING MULTI
+    if parsed["type"] == "breastfeeding_multi":
+        items = parsed.get("items", [])
+        # if any item missing duration -> ask
+        if any(to_int(x.get("duration", 0)) == 0 for x in items):
+            user[KEY_PENDING] = {"type": "breastfeeding", "side": items[0].get("side", "לא צוין")}
+            db.upsert(user, User.id == user["id"])
+            replies.append("כמה דקות הייתה ההנקה?")
+            return replies
+
+        for x in items:
+            add_event(uid, "breastfeeding", {"side": x.get("side", "לא צוין"), "duration": to_int(x.get("duration", 0))})
+        # response like your screenshot style: list each side
+        lines = [f"🤱 נרשמה הנקה: {x.get('side','לא צוין')} {to_int(x.get('duration',0))} דק׳ ✅" for x in items]
+        replies.extend(lines)
+
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+        return replies
+
+    # LOGGING: BREASTFEEDING SINGLE
+    if parsed["type"] == "breastfeeding":
+        side = parsed.get("side", "לא צוין")
+        dur = to_int(parsed.get("duration", 0))
+        if dur > 0:
+            add_event(uid, "breastfeeding", {"side": side, "duration": dur})
+            replies.append(f"🤱 נרשמה הנקה: {side} {dur} דק׳ ✅")
+        else:
+            user[KEY_PENDING] = {"type": "breastfeeding", "side": side}
+            db.upsert(user, User.id == user["id"])
+            replies.append(f"כמה דקות הייתה ההנקה ב-{side}?")
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+        return replies
+
+    # LOGGING: DIAPER
+    if parsed["type"] == "diaper":
+        dtype = parsed.get("diaper_type", "החלפה")
+        add_event(uid, "diaper", {"type": dtype})
+        replies.append(f"🧷 נרשם חיתול: {dtype} ✅")
+
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+        return replies
+
+    # LOGGING: SLEEP START
+    if parsed["type"] == "sleep_start":
         user[KEY_SLEEP_START] = get_now_tz().isoformat()
-        upsert_user(user)
-        return [f"לילה טוב ל{baby}... 😴"]
+        db.upsert(user, User.id == user["id"])
+        replies.append(f"לילה טוב ל{baby}... 😴")
+        return replies
 
-    if t == "sleep_end":
-        end_dt = get_now_tz()
+    # LOGGING: SLEEP END
+    if parsed["type"] == "sleep_end":
         start_str = user.get(KEY_SLEEP_START)
+        end_dt = get_now_tz()
         if start_str:
             try:
                 start_dt = dt.datetime.fromisoformat(start_str)
+            except:
+                start_dt = None
+
+            if start_dt:
                 mins = int((end_dt - start_dt).total_seconds() / 60)
-                add_event(user[KEY_ID], "sleep", {
-                    "duration_min": mins,
-                    "start_ts": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                })
-                res.append(f"בוקר טוב! {baby} {p['slept']} {mins} דקות. ☀️")
-            except Exception:
-                add_event(user[KEY_ID], "sleep", {"action": "wake_up", "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S")})
-                res.append("רשמתי התעוררות עכשיו (הייתה בעיה בקריאת זמן ההירדמות).")
+                add_event(
+                    uid,
+                    "sleep",
+                    {
+                        "duration_min": mins,
+                        "start_ts": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                )
+                replies.append(f"בוקר טוב! {baby} {verb_sleep(user)} {mins} דקות. ☀️")
+            else:
+                add_event(uid, "sleep", {"action": "wake_up", "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S")})
+                replies.append(f"רשמתי ש{baby_pronoun(user)} התעורר/ה עכשיו (לא הצלחתי לקרוא את תחילת השינה).")
         else:
-            add_event(user[KEY_ID], "sleep", {"action": "wake_up", "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S")})
-            res.append("רשמתי שהוא התעורר עכשיו (לא מצאתי מתי נרדם).")
+            add_event(uid, "sleep", {"action": "wake_up", "end_ts": end_dt.strftime("%Y-%m-%d %H:%M:%S")})
+            replies.append(f"רשמתי ש{baby_pronoun(user)} התעורר/ה עכשיו (לא מצאתי מתי נרדם/ה).")
 
         user[KEY_SLEEP_START] = None
-        upsert_user(user)
-        res.extend(apply_milestones(user))
-        return res
+        db.upsert(user, User.id == user["id"])
 
-    if t == "sleep_manual":
-        dur = to_int(parsed.get("duration", 0))
-        if dur <= 0:
+        user2 = get_user_by_uid(normalize_phone(uid))
+        msg = maybe_add_milestone_message(user2) if user2 else None
+        if msg:
+            replies.append(msg)
+
+        return replies
+
+    # LOGGING: SLEEP MANUAL
+    if parsed["type"] == "sleep_manual":
+        mins = to_int(parsed.get("duration", 0))
+        if mins > 0:
+            add_event(uid, "sleep", {"duration_min": mins})
+            replies.append(f"😴 נרשמה שינה של {mins} דקות ✅")
+            user2 = get_user_by_uid(normalize_phone(uid))
+            msg = maybe_add_milestone_message(user2) if user2 else None
+            if msg:
+                replies.append(msg)
+        else:
             user[KEY_PENDING] = {"type": "sleep_manual"}
-            upsert_user(user)
-            return [f"כמה דקות {baby} {p['slept']}?"]
-        add_event(user[KEY_ID], "sleep", {"duration_min": dur})
-        res.append(f"רשמתי ש{baby} {p['slept']} {dur} דקות. ✅")
-        res.extend(apply_milestones(user))
-        return res
+            db.upsert(user, User.id == user["id"])
+            replies.append("כמה דקות הייתה השינה?")
+        return replies
 
-    # ---- breastfeeding ----
-    if t == "breastfeeding":
-        dur = to_int(parsed.get("duration", 0))
-        side = parsed.get("side", "לא צוין")
-        if dur <= 0:
-            user[KEY_PENDING] = {"type": "breastfeeding", "side": side}
-            upsert_user(user)
-            return [f"כמה דקות {baby} ינק?"]
-        add_event(user[KEY_ID], "breastfeeding", {"side": side, "duration": dur})
-        res.append(f"נרשמה הנקה ({side}, {dur} דק'). ❤️")
-        res.extend(apply_milestones(user))
-        return res
-
-    # ---- bottle ----
-    if t == "bottle":
-        amt = to_int(parsed.get("amount", 0))
-        if amt <= 0:
-            user[KEY_PENDING] = {"type": "bottle"}
-            upsert_user(user)
-            return [f"כמה מ\"ל {baby} {p['ate']}?"]
-        add_event(user[KEY_ID], "bottle", {"amount": amt})
-        res.append(f"נרשם בקבוק של {amt} מ\"ל. 🍼")
-        res.extend(apply_milestones(user))
-        return res
-
-    # ---- diaper ----
-    if t == "diaper":
-        dtype = parsed.get("diaper_type", "החלפה")
-        add_event(user[KEY_ID], "diaper", {"type": dtype})
-        res.append(f"חיתול נרשם ({dtype}). ✅")
-        res.extend(apply_milestones(user))
-        return res
-
-    # ---- add partner ----
-    if t == "add_partner":
-        phone = parsed.get("phone")
-        if not phone:
-            return ["לא מצאתי מספר תקין. נסי: 'הוסף בן זוג 0501234567'"]
-        p_uid = normalize_phone(phone)
-        user[KEY_PARTNER_PHONE] = p_uid
-        upsert_user(user)
-        return [f"הוספתי את בן הזוג (מספר: {p_uid})! 🤝"]
-
-    # ---- query last ----
-    if t == "query_last":
-        last = get_last_event(user, parsed.get("targets", []))
-        if not last:
-            return [f"לא מצאתי תיעוד של {parsed.get('label','זה')}. 🧐"]
-
-        # אם ביקשו “סאב” שונה – משתמשים ב-start_ts/end_ts אם קיים
-        sub = parsed.get("sub_type")
-        ts_str = last.get("timestamp", "")
-        if sub == "start":
-            ts_str = last.get("details", {}).get("start_ts") or ts_str
-        elif sub == "end":
-            ts_str = last.get("details", {}).get("end_ts") or ts_str
-
-        ts = safe_parse_dt(ts_str)
-        if not ts:
-            return ["מצאתי אירוע, אבל הייתה בעיה לקרוא את הזמן שלו."]
-
-        diff_str = format_timedelta(get_now_tz() - ts)
-        return [f"{parsed.get('label','הפעולה')} האחרונה הייתה {diff_str} ({ts.strftime('%H:%M')})."]
-
-    # ---- query awake ----
-    if t == "query_awake":
-        last_sleep = get_last_event(user, ["sleep"])
-        if last_sleep and last_sleep.get("details", {}).get("end_ts"):
-            end_ts = safe_parse_dt(last_sleep["details"]["end_ts"])
-            if end_ts:
-                diff_str = format_timedelta(get_now_tz() - end_ts).replace("לפני ", "")
-                return [f"{baby} ער כבר {diff_str}. ⏰"]
-        return ["אין לי תיעוד של התעוררות אחרונה."]
-
-    # ---- add reminder ----
-    if t == "add_reminder":
-        text = parsed.get("text", "תזכורת")
-        hrs = to_int(parsed.get("hours", 0))
-        add_reminder(user, text=text, hours_from_now=hrs)
-        if hrs > 0:
-            return [f"רשמתי תזכורת: “{text}” לעוד {hrs} שעות. ✨\n(כרגע אין הודעות מתוזמנות – אציג לך אותה בסטטוס/תזכורות כשהזמן יגיע.)"]
-        return [f"רשמתי תזכורת: “{text}”. ✨\n(אציג אותה בסטטוס/תזכורות כשהזמן יגיע.)"]
-
-    # ---- reminders list / done ----
-    if t == "reminders_list":
-        msg = list_due_reminders(user)
-        return [msg] if msg else ["אין תזכורות שהגיע הזמן אליהן כרגע. ✅"]
-
-    if t == "reminder_done":
-        idx = to_int(parsed.get("idx", 0))
-        return [mark_reminder_done(user, idx)]
-
-    return ["לא בטוחה שהבנתי... 🧐 נסי 'עזרה', 'סטטוס', 'סיכום', 'השוואה' או 'בטל'."]
-
+    # Unknown
+    replies.append("לא בטוחה שהבנתי... 🧐 נסי: 'ימין 10', 'בקבוק 120', 'שאיבה 80', 'פיפי', 'סטטוס', 'סיכום', או 'עזרה'.")
+    return replies
 
 # ====================================================
-# IX. Flask Webhook + Onboarding
+# XII. Webhook
 # ====================================================
-app = Flask(__name__)
-
 @app.route("/sms", methods=["POST"])
 def whatsapp_webhook():
-    msg_raw = (request.values.get("Body", "") or "").strip()
-    from_raw = request.values.get("From", "") or ""
+    msg_raw = request.values.get("Body", "").strip()
+    from_raw = request.values.get("From", "")
     uid = normalize_phone(from_raw)
-
     resp = MessagingResponse()
 
-    # 1) RESET
-    if msg_raw.lower().strip() in ["אפס", "reset"]:
-        remove_user(uid)
+    # Fetch user
+    user = get_user_by_uid(uid)
+
+    # Reset
+    if msg_raw.lower() in ["אפס", "reset"]:
+        if user:
+            db.remove(User.id == user["id"])
         resp.message("איתחלנו! שלחי הודעה כלשהי כדי להתחיל מחדש. ❤️")
         return str(resp)
 
-    # 2) Load / create user
-    user = get_user_by_uid(uid)
-
+    # New user: stage 1 (ask mom name)
     if not user:
-        user = {KEY_ID: uid, KEY_STAGE: 1, KEY_EVENTS: [], KEY_PENDING: None}
-        upsert_user(user)
-        resp.message("היי! אני בילי 🧚\nאיך קוראים לבייבי?")
+        db.insert({"id": uid, KEY_STAGE: 1})
+        resp.message(reg_message_stage_1())
         return str(resp)
 
-    stage = to_int(user.get(KEY_STAGE, 5))
+    stage = user.get(KEY_STAGE, 5)
 
-    # Onboarding stage 1: name
+    # Stage 1: mom name
     if stage == 1:
-        user[KEY_NAME] = msg_raw
+        mom_name = msg_raw.strip()
+        user[KEY_MOM_NAME] = mom_name
         user[KEY_STAGE] = 2
-        upsert_user(user)
-        resp.message(f"איזה שם מקסים! ומה המגדר? כתבי: בן / בת")
+        db.upsert(user, User.id == user["id"])
+        resp.message(reg_message_stage_2(mom_name))
         return str(resp)
 
-    # Onboarding stage 2: gender
+    # Stage 2: baby name
     if stage == 2:
+        baby_name = msg_raw.strip()
+        user[KEY_BABY_NAME] = baby_name
+        user[KEY_STAGE] = 3
+        db.upsert(user, User.id == user["id"])
+        resp.message(reg_message_stage_3(baby_name))
+        return str(resp)
+
+    # Stage 3: baby gender
+    if stage == 3:
         m = clean_msg(msg_raw)
-        if "בת" in m or "נקבה" in m:
-            user[KEY_GENDER] = "f"
-        elif "בן" in m or "זכר" in m:
-            user[KEY_GENDER] = "m"
+        if m in ["1", "בן", "זכר", "male"]:
+            user[KEY_BABY_GENDER] = "male"
+        elif m in ["2", "בת", "נקבה", "female"]:
+            user[KEY_BABY_GENDER] = "female"
         else:
-            resp.message("לא הצלחתי להבין. כתבי בבקשה: בן / בת")
+            resp.message("לא הצלחתי להבין 🙏 כתבי 1) בן או 2) בת")
             return str(resp)
 
-        user[KEY_STAGE] = 3
-        upsert_user(user)
-        resp.message(f"מעולה. ומה תאריך הלידה? (למשל: 01/01/2024)")
+        user[KEY_STAGE] = 4
+        db.upsert(user, User.id == user["id"])
+        resp.message(reg_message_stage_4())
         return str(resp)
 
-    # Onboarding stage 3: DOB
-    if stage == 3:
+    # Stage 4: DOB
+    if stage == 4:
         formatted = validate_and_format_dob(msg_raw)
         if not formatted:
-            resp.message("אופס, התאריך לא נראה תקין. נסי שוב בפורמט: 01/01/2024")
+            resp.message("אופס, התאריך לא נראה תקין. נסי שוב בפורמט: 01/01/2025")
             return str(resp)
+
         user[KEY_DOB] = formatted
         user[KEY_STAGE] = 5
-        upsert_user(user)
-        resp.message("הכל מוכן! ✨\nאפשר לכתוב: 'נרדם', 'הנקה ימין 10', 'בקבוק 120', 'חיתול קקי', 'סטטוס', 'סיכום', 'השוואה', 'בטל'.")
+        db.upsert(user, User.id == user["id"])
+        resp.message(after_registration_welcome(user))
         return str(resp)
 
-    # 3) Normal operation
+    # Main flow
     parsed = parse_input(msg_raw, user)
+    replies = handle_command(uid, user, parsed)
 
-    if parsed["type"] == "help_menu":
-        resp.message(HELP_TOPICS["menu"])
-        return str(resp)
-
-    if parsed["type"] == "help_item":
-        resp.message(HELP_TOPICS[parsed["id"]]["text"] + LEGAL_DISCLAIMER)
-        return str(resp)
-
-    if parsed["type"] == "status":
-        # status includes: last 5 today + insights + due reminders
-        baby = user.get(KEY_NAME, "הבייבי")
-        age = calculate_age(user.get(KEY_DOB))
-        header = f"סטטוס {baby} ({age}):\n\n"
-
-        t = today_str()
-        events = [e for e in user.get(KEY_EVENTS, []) if (e.get("timestamp", "").startswith(t))]
-        last5 = events[-5:]
-
-        if last5:
-            lines = [format_event_human(user, e) for e in last5]
-            body = "\n".join(lines)
-        else:
-            body = "אין תיעוד מהיום עדיין."
-
-        blocks = [header + body]
-
-        insight = get_health_insights(user)
-        if insight:
-            blocks.append("\n" + insight)
-
-        due = list_due_reminders(user)
-        if due:
-            blocks.append("\n\n" + due)
-
-        resp.message("\n".join(blocks))
-        return str(resp)
-
-    if parsed["type"] == "comparison":
-        resp.message(get_comparison_report(user))
-        return str(resp)
-
-    if parsed["type"] == "summary":
-        resp.message(get_summary(user, hours=parsed.get("hours")))
-        return str(resp)
-
-    # everything else through business logic
-    for msg in handle_logging(uid, parsed, user):
-        resp.message(msg)
+    for r in replies:
+        resp.message(r)
 
     return str(resp)
 
-
+# ====================================================
+# XIII. Run (Render-ready)
+# ====================================================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
