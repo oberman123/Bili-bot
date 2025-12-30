@@ -1,10 +1,8 @@
 import os
 import datetime as dt
 import re
-import random
 import psycopg2
 import psycopg2.extras
-from datetime import timedelta
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -20,10 +18,11 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # הערה: אם כבר הרצת את הקוד והטבלה תוקנה, אפשר להפוך את ה-DROP להערה
-    # cur.execute("DROP TABLE IF EXISTS users;") 
+    # פעולה קריטית: מחיקת הטבלה הישנה כדי לאפס את המבנה שלה
+    print("Refreshing database table structure...")
+    cur.execute("DROP TABLE IF EXISTS users;") 
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE users (
             phone_number TEXT PRIMARY KEY,
             data JSONB DEFAULT '{}'::jsonb,
             registration_step TEXT DEFAULT 'START'
@@ -33,6 +32,7 @@ def init_db():
     cur.close()
     conn.close()
 
+# הרצתח האתחול בכל פעם שהאפליקציה עולה
 init_db()
 
 # ====================================================
@@ -67,15 +67,13 @@ def parse_input(text):
         parsed['event_type'] = 'sleep'
     elif any(word in text for word in ['סטטוס', 'סיכום', 'פרטי']):
         parsed['event_type'] = 'status'
-    elif 'עזרה' in text:
-        parsed['event_type'] = 'help'
-
+    
     return parsed
 
 def get_gender_strings(gender):
     if gender and 'בת' in str(gender):
-        return {"suffix": "ה", "verb_sleep": "ישנה", "verb_wake": "התעוררה", "verb_eat": "ינקה", "verb_drink": "שתתה"}
-    return {"suffix": "", "verb_sleep": "ישן", "verb_wake": "התעורר", "verb_eat": "ינק", "verb_drink": "שתה"}
+        return {"verb_sleep": "ישנה", "verb_wake": "התעוררה", "verb_eat": "ינקה"}
+    return {"verb_sleep": "ישן", "verb_wake": "התעורר", "verb_eat": "ינק"}
 
 # ====================================================
 # III. ניהול ה-Webhook
@@ -90,90 +88,88 @@ def whatsapp_webhook():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    cur.execute("SELECT data, registration_step FROM users WHERE phone_number = %s", (user_phone,))
-    row = cur.fetchone()
-    
-    if not row:
-        cur.execute("INSERT INTO users (phone_number, registration_step) VALUES (%s, 'START')", (user_phone,))
-        conn.commit()
-        user_data, step = {}, 'START'
-    else:
-        user_data, step = row
-
-    if step != 'COMPLETED':
-        if step == 'START':
-            resp.message("היי! 👋 אני בילי... איך קוראים לך?")
-            cur.execute("UPDATE users SET registration_step = 'ASK_GENDER' WHERE phone_number = %s", (user_phone,))
-        elif step == 'ASK_GENDER':
-            user_data['mom_name'] = incoming_msg
-            resp.message(f"נעים מאוד {incoming_msg}! ❤️ מה נולד לנו? (בן/בת)")
-            cur.execute("UPDATE users SET data = %s, registration_step = 'ASK_BABY_NAME' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
-        elif step == 'ASK_BABY_NAME':
-            user_data['baby_gender'] = incoming_msg
-            resp.message(f"מזל טוב! ואיך קראתם ל{'קטן' if 'בן' in incoming_msg else 'קטנה'}?")
-            cur.execute("UPDATE users SET data = %s, registration_step = 'ASK_DOB' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
-        elif step == 'ASK_DOB':
-            user_data['baby_name'] = incoming_msg
-            resp.message(f"שם מהמם! מתי {incoming_msg} נולד/ה? (תאריך)")
-            cur.execute("UPDATE users SET data = %s, registration_step = 'COMPLETED' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
-        elif step == 'COMPLETED':
-            user_data['events'] = []
-            resp.message("איזה כיף! סיימנו. פשוט כתבי לי מה קורה: 'הנקה', 'נרדם' או 'סטטוס'.")
-            cur.execute("UPDATE users SET data = %s, registration_step = 'COMPLETED' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
+    try:
+        cur.execute("SELECT data, registration_step FROM users WHERE phone_number = %s", (user_phone,))
+        row = cur.fetchone()
         
+        if not row:
+            cur.execute("INSERT INTO users (phone_number, registration_step) VALUES (%s, 'START')", (user_phone,))
+            conn.commit()
+            user_data, step = {}, 'START'
+        else:
+            user_data, step = row
+
+        if step != 'COMPLETED':
+            if step == 'START':
+                resp.message("היי! אני בילי. נעים מאוד! איך קוראים לך?")
+                cur.execute("UPDATE users SET registration_step = 'ASK_GENDER' WHERE phone_number = %s", (user_phone,))
+            elif step == 'ASK_GENDER':
+                user_data['mom_name'] = incoming_msg
+                resp.message(f"נעים מאוד {incoming_msg}! מה נולד לנו? (בן/בת)")
+                cur.execute("UPDATE users SET data = %s, registration_step = 'ASK_BABY_NAME' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
+            elif step == 'ASK_BABY_NAME':
+                user_data['baby_gender'] = incoming_msg
+                resp.message(f"מזל טוב! איך קראתם ל{'קטן' if 'בן' in incoming_msg else 'קטנה'}?")
+                cur.execute("UPDATE users SET data = %s, registration_step = 'ASK_DOB' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
+            elif step == 'ASK_DOB':
+                user_data['baby_name'] = incoming_msg
+                resp.message(f"שם מהמם! מתי {incoming_msg} נולד/ה?")
+                cur.execute("UPDATE users SET data = %s, registration_step = 'COMPLETED' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
+            elif step == 'COMPLETED':
+                user_data['events'] = []
+                resp.message("סיימנו! עכשיו אפשר לתעד הנקות, שינה ובקבוקים.")
+                cur.execute("UPDATE users SET data = %s, registration_step = 'COMPLETED' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
+            
+            conn.commit()
+            return str(resp)
+
+        # לוגיקה רגילה
+        parsed = parse_input(incoming_msg)
+        baby_name = user_data.get('baby_name', 'הבייבי')
+        g = get_gender_strings(user_data.get('baby_gender', 'בן'))
+        now = dt.datetime.now()
+
+        if parsed['event_type'] in ['breastfeeding', 'sleep']:
+            if parsed['duration']:
+                action = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
+                user_data.setdefault('events', []).append({'type': action, 'duration': parsed['duration'], 'time': now.isoformat()})
+                resp.message(f"רשמתי ש{baby_name} {action} {parsed['duration']} דקות. ❤️")
+            elif parsed['is_end']:
+                type_to_find = 'הנקה' if parsed['event_type'] == 'breastfeeding' else 'שינה'
+                last_event = next((e for e in reversed(user_data.get('events', [])) if e['type'] == type_to_find and 'end_time' not in e), None)
+                if last_event:
+                    start_time = dt.datetime.fromisoformat(last_event['time'])
+                    duration = int((now - start_time).total_seconds() / 60)
+                    last_event['end_time'] = now.isoformat()
+                    last_event['duration'] = duration
+                    resp.message(f"{baby_name} {g['verb_sleep' if parsed['event_type']=='sleep' else 'verb_eat']} {duration} דקות.")
+                else:
+                    resp.message(f"לא מצאתי טיימר פתוח ל{baby_name}.")
+            else:
+                action_name = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
+                user_data.setdefault('events', []).append({'type': action_name, 'time': now.isoformat()})
+                resp.message(f"התחלתי טיימר ל{action_name}.")
+
+        elif parsed['event_type'] == 'status':
+            events = user_data.get('events', [])
+            summary = f"סיכום עבור {baby_name}:\n"
+            for e in events[-3:]:
+                summary += f"- {e['type']} ב-{e['time'][11:16]}\n"
+            resp.message(summary)
+        else:
+            resp.message(f"קיבלתי! את אלופה.")
+
+        cur.execute("UPDATE users SET data = %s WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
         conn.commit()
+
+    except Exception as e:
+        print(f"Error: {e}")
+        resp.message("משהו קצת השתבש, נסי שוב בעוד רגע.")
+    
+    finally:
         cur.close()
         conn.close()
-        return str(resp)
-
-    parsed = parse_input(incoming_msg)
-    baby_name = user_data.get('baby_name', 'הבייבי')
-    g = get_gender_strings(user_data.get('baby_gender', 'בן'))
-    now = dt.datetime.now()
-
-    if parsed['event_type'] in ['breastfeeding', 'sleep']:
-        if parsed['duration']:
-            action = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
-            resp.message(f"רשמתי ש{baby_name} {action} {parsed['duration']} דקות. את אלופה! ❤️")
-            user_data.setdefault('events', []).append({'type': action, 'duration': parsed['duration'], 'time': now.isoformat()})
-        elif parsed['is_end']:
-            last_event = next((e for e in reversed(user_data.get('events', [])) if e['type'] == ('הנקה' if parsed['event_type']=='breastfeeding' else 'שינה') and 'end_time' not in e), None)
-            if last_event:
-                start_time = dt.datetime.fromisoformat(last_event['time'])
-                duration = int((now - start_time).total_seconds() / 60)
-                last_event['end_time'] = now.isoformat()
-                last_event['duration'] = duration
-                msg = f"בוקר טוב! {baby_name} {g['verb_sleep' if parsed['event_type']=='sleep' else 'verb_eat']} {duration} דקות. ✨"
-                resp.message(msg)
-            else:
-                resp.message(f"רשמתי ש{baby_name} {g['verb_wake' if parsed['event_type']=='sleep' else 'verb_eat']}, אבל לא מצאתי טיימר פתוח.")
-        else:
-            action_name = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
-            user_data.setdefault('events', []).append({'type': action_name, 'time': now.isoformat(), 'side': parsed['side']})
-            resp.message(f"רשמתי שהתחלתם {action_name}. כשתסיימו, פשוט כתבי 'סיימתי' או 'קם'.")
-
-    elif parsed['event_type'] == 'bottle':
-        amount = parsed['amount'] or "לא צוין"
-        user_data.setdefault('events', []).append({'type': 'בקבוק', 'amount': amount, 'time': now.isoformat()})
-        resp.message(f"רשמתי בקבוק של {amount} מ\"ל ל{baby_name}. לרוויה! 🍼")
-
-    elif parsed['event_type'] == 'status':
-        events = user_data.get('events', [])
-        if not events:
-            resp.message(f"עוד לא רשמנו כלום היום עבור {baby_name}. ❤️")
-        else:
-            summary = f"📊 *סיכום עבור {baby_name}:*\n"
-            for e in events[-5:]:
-                time_str = dt.datetime.fromisoformat(e['time']).strftime('%H:%M')
-                summary += f"• {e['type']} ({e.get('duration', e.get('amount', ''))}) ב-{time_str}\n"
-            resp.message(summary)
-    else:
-        resp.message(f"קיבלתי! את עושה עבודה מדהימה עם {baby_name}. ❤️")
-
-    cur.execute("UPDATE users SET data = %s WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
-    conn.commit()
-    cur.close()
-    conn.close()
+        
     return str(resp)
 
 if __name__ == "__main__":
