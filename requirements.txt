@@ -27,3 +27,4 @@ gunicorn
 # ספריות ל-PostgreSQL
 SQLAlchemy==2.0.36
 psycopg2-binary
+pytz
