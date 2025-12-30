@@ -18,7 +18,9 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # טבלת משתמשים לרישום ראשוני
+    # הוסיפי את שתי השורות הבאות כדי לאפס את הטבלאות הישנות:
+    cur.execute("DROP TABLE IF EXISTS users CASCADE")
+    cur.execute("DROP TABLE IF EXISTS events CASCADE")
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             phone_number TEXT PRIMARY KEY,
