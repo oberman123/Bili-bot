@@ -11,7 +11,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 app = Flask(__name__)
 
 # ====================================================
-# I. הגדרות וחיבור למסד הנתונים (PostgreSQL)
+# I. הגדרות וחיבור למסד הנתונים
 # ====================================================
 
 def get_db_connection():
@@ -20,6 +20,8 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    # מוחקים את הטבלה הישנה כדי לרענן את המבנה לעמודת JSONB
+    cur.execute("DROP TABLE IF EXISTS users;") 
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             phone_number TEXT PRIMARY KEY,
@@ -34,7 +36,7 @@ def init_db():
 init_db()
 
 # ====================================================
-# II. לוגיקה שפתית (NLP) ועיבוד נתונים מהקוד המקורי
+# II. לוגיקה שפתית (NLP)
 # ====================================================
 
 def parse_input(text):
@@ -55,7 +57,7 @@ def parse_input(text):
     elif 'חצי שעה' in text: parsed['duration'] = 30
     elif 'רבע שעה' in text: parsed['duration'] = 15
 
-    # סוג אירוע
+    # סיווג אירוע
     if any(word in text for word in ['הנקה', 'ינק', 'צד', 'ימין', 'שמאל']):
         parsed['event_type'] = 'breastfeeding'
         parsed['side'] = 'ימין' if 'ימין' in text else 'שמאל' if 'שמאל' in text else None
@@ -73,12 +75,12 @@ def parse_input(text):
     return parsed
 
 def get_gender_strings(gender):
-    if 'בת' in gender:
+    if 'בת' in str(gender):
         return {"suffix": "ה", "verb_sleep": "ישנה", "verb_wake": "התעוררה", "verb_eat": "ינקה", "verb_drink": "שתתה"}
     return {"suffix": "", "verb_sleep": "ישן", "verb_wake": "התעורר", "verb_eat": "ינק", "verb_drink": "שתה"}
 
 # ====================================================
-# III. ניהול ה-Webhook
+# III. ניהול ה-Webhook (הודעות נכנסות)
 # ====================================================
 
 @app.route("/sms", methods=['POST'])
@@ -89,6 +91,7 @@ def whatsapp_webhook():
     
     conn = get_db_connection()
     cur = conn.cursor()
+    
     cur.execute("SELECT data, registration_step FROM users WHERE phone_number = %s", (user_phone,))
     row = cur.fetchone()
     
@@ -99,7 +102,7 @@ def whatsapp_webhook():
     else:
         user_data, step = row
 
-    # --- תהליך רישום (Onboarding) ---
+    # --- תהליך רישום ---
     if step != 'COMPLETED':
         if step == 'START':
             resp.message("היי! 👋 אני בילי... אני כאן כדי לעזור לך לתעד ולהקל על החודשים הראשונים. את אלופה! 😍\n\nאיך קוראים לך?")
@@ -122,23 +125,21 @@ def whatsapp_webhook():
             cur.execute("UPDATE users SET data = %s, registration_step = 'COMPLETED' WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
         
         conn.commit()
+        cur.close()
+        conn.close()
         return str(resp)
 
     # --- לוגיקה לאחר רישום ---
     parsed = parse_input(incoming_msg)
     baby_name = user_data.get('baby_name', 'הבייבי')
-    g = get_gender_strings(user_data.get('baby_gender', 'בן'))
+    gender_data = get_gender_strings(user_data.get('baby_gender', 'בן'))
     now = dt.datetime.now()
 
-    # טיפול בטיימרים (הנקה/שינה)
     if parsed['event_type'] in ['breastfeeding', 'sleep']:
-        # אם המשתמשת ציינה זמן מראש
         if parsed['duration']:
             action = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
             resp.message(f"רשמתי ש{baby_name} {action} {parsed['duration']} דקות. את אלופה! ❤️")
             user_data.setdefault('events', []).append({'type': action, 'duration': parsed['duration'], 'time': now.isoformat()})
-        
-        # אם המשתמשת הודיעה על סיום (קם/סיימתי)
         elif parsed['is_end']:
             last_event = next((e for e in reversed(user_data.get('events', [])) if e['type'] == parsed['event_type'] and 'end_time' not in e), None)
             if last_event:
@@ -146,43 +147,4 @@ def whatsapp_webhook():
                 duration = int((now - start_time).total_seconds() / 60)
                 last_event['end_time'] = now.isoformat()
                 last_event['duration'] = duration
-                resp.message(f"בוקר טוב! {baby_name} {g['verb_sleep' if parsed['event_type']=='sleep' else 'verb_eat']} {duration} דקות. ✨")
-            else:
-                resp.message(f"רשמתי ש{baby_name} {g['verb_wake' if parsed['event_type']=='sleep' else 'verb_eat']}, אבל לא רשמנו מתי זה התחיל.")
-        
-        # התחלת טיימר
-        else:
-            action_name = "הנקה" if parsed['event_type'] == 'breastfeeding' else "שינה"
-            user_data.setdefault('events', []).append({'type': action_name, 'time': now.isoformat(), 'side': parsed['side']})
-            resp.message(f"רשמתי שהתחלתם {action_name}. כשתסיימו, פשוט כתבי לי 'סיימתי' או 'קם'.")
-
-    elif parsed['event_type'] == 'bottle':
-        amount = parsed['amount'] or "לא צוין"
-        user_data.setdefault('events', []).append({'type': 'בקבוק', 'amount': amount, 'time': now.isoformat()})
-        resp.message(f"רשמתי בקבוק של {amount} מ\"ל ל{baby_name}. לרוויה! 🍼")
-
-    elif parsed['event_type'] == 'status':
-        events = user_data.get('events', [])
-        if not events:
-            resp.message(f"עוד לא רשמנו כלום היום עבור {baby_name}. הכל בסדר! ❤️")
-        else:
-            summary = f"📊 *סיכום עבור {baby_name}:*\n"
-            for e in events[-5:]:
-                time_str = dt.datetime.fromisoformat(e['time']).strftime('%H:%M')
-                summary += f"• {e['type']} ({e.get('duration', e.get('amount', ''))} דק'/מ\"ל) ב-{time_str}\n"
-            resp.message(summary)
-
-    elif parsed['event_type'] == 'help':
-        resp.message("אני בילי! אני יודעת למדוד זמני שינה והנקה (פשוט כתבי 'נרדם' או 'הנקה'), לתעד בקבוקים ולתת לך סטטוס יומי.")
-
-    else:
-        resp.message(f"קיבלתי! את עושה עבודה מדהימה עם {baby_name}. ❤️")
-
-    cur.execute("UPDATE users SET data = %s WHERE phone_number = %s", (psycopg2.extras.Json(user_data), user_phone))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return str(resp)
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=10000)
+                resp.message(f"בוקר טוב! {baby_
